@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ギターコード → MIDI（.mid）ジェネレーター（軽量版）</title>
+  <style>
+    body { font-family: monospace; background:#111; color:#eee; margin:0; padding:20px; }
+    textarea, input { width:100%; margin-top:6px; margin-bottom:12px; background:#222; color:#eee; border:1px solid #444; padding:6px; border-radius:4px; }
+    button { background:#333; color:#eee; padding:8px 14px; border:1px solid #555; border-radius:4px; cursor:pointer; }
+    button:hover { background:#555; }
+    pre { background:#000; padding:10px; overflow:auto; max-height:400px; }
+  </style>
+</head>
+<body>
+  <h1>ギターコード → MIDI（.mid）ジェネレーター（サウンドフォント不要の軽量版）</h1>
+  <label>コード列（空白/タブ/改行区切り）:</label>
+  <textarea id="input" rows="6" placeholder="C  Cm  C7  Cm7  CM7  Csus4  C7sus4  Cadd9  Cm7b5  Cdim7  C6  Caug  CmM7  Cm6\n2分C 4部D 8部G7 C/E Dm/F G/B"></textarea>
+
+  <label>BPM: <input type="number" id="bpm" value="120" min="20" max="300"></label>
+  <label>分解能 (TPQ): <input type="number" id="ppq" value="480" min="48" max="9600"></label>
+  <label>基準オクターブ: <input type="number" id="octave" value="4" min="0" max="8"></label>
+
+  <button id="genBtn">MIDIファイル生成</button>
+  <button id="copyAscii">ASCIIプレビューをコピー</button>
+
+  <h3>ASCIIプレビュー</h3>
+  <pre id="ascii">(ここに解析結果が表示されます)</pre>
+
+<script>
+// ====== ユーティリティ ======
+function toHalfWidth(str){
+  return str.replace(/[！-～]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0))
+            .replace(/[♯＃]/g,'#').replace(/[♭ｂ]/g,'b').trim();
+}
+const PITCH_CLASS={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+function noteNumber(root,oct){
+  const m=root.match(/^([A-G])([#b]?)/i);if(!m)throw Error('音名エラー:'+root);
+  let pc=PITCH_CLASS[m[1].toUpperCase()];if(m[2]==='#')pc++;if(m[2]==='b')pc--;
+  return (pc+12)%12+(oct+1)*12;
+}
+function chordFormula(sym){
+  if(!sym)return[0,4,7];
+  if(/7sus4$/i.test(sym))return[0,5,7,10];
+  if(/sus4$/i.test(sym))return[0,5,7];
+  if(/^(dim7|o7|°7)$/i.test(sym))return[0,3,6,9];
+  if(/^(dim|o|°)$/i.test(sym))return[0,3,6];
+  if(/^mM7$/i.test(sym)||/^mMaj7$/i.test(sym))return[0,3,7,11];
+  if(/^m7b5$/i.test(sym)||/^m7♭5$/i.test(sym)||/^ø7$/i.test(sym))return[0,3,6,10];
+  if(/^m7$/i.test(sym))return[0,3,7,10];
+  if(/^m6$/i.test(sym))return[0,3,7,9];
+  if(/^m$/i.test(sym))return[0,3,7];
+  if(/^(M7|maj7|Δ7)$/i.test(sym))return[0,4,7,11];
+  if(/^6$/i.test(sym))return[0,4,7,9];
+  if(/^7$/i.test(sym))return[0,4,7,10];
+  if(/^(aug|\+)$/i.test(sym))return[0,4,8];
+  if(/add9$/i.test(sym))return[0,4,7,14];
+  return[0,4,7];
+}
+function parseToken(raw){
+  const t=toHalfWidth(raw);
+  const m=t.match(/^(\d+)\s*[分部]?\s*([A-G][#b]?)(.*)$/i);
+  let quarters,chStr;
+  if(m){quarters=4/parseInt(m[1]);chStr=(m[2]+(m[3]||''));}else{quarters=4;chStr=t;}
+  const m2=chStr.match(/^([A-G][#b]?)(.*)$/i);
+  return{raw:t,root:m2[1],qual:m2[2].trim(),quarters};
+}
+
+// ===== MIDIバイナリ生成 =====
+function u16(n){return[(n>>8)&255,n&255];}
+function u32(n){return[(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255];}
+function vlq(n){let b=[n&0x7F];while((n>>=7))b.unshift((n&0x7F)|0x80);return b;}
+function meta(delta,type,data){return[...vlq(delta),0xFF,type,...vlq(data.length),...data];}
+function noteOn(d,ch,n,v){return[...vlq(d),0x90|(ch&15),n&127,v&127];}
+function noteOff(d,ch,n,v){return[...vlq(d),0x80|(ch&15),n&127,v&127];}
+function programChange(d,ch,p){return[...vlq(d),0xC0|(ch&15),p&127];}
+function tempoMeta(bpm){const mpqn=Math.round(60000000/bpm);return meta(0,0x51,[(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]);}
+function buildTrack(events){const body=[];events.forEach(e=>body.push(...e));return[77,84,114,107,...u32(body.length),...body];}
+function makeMidi(track,ppq){const header=[77,84,104,100,...u32(6),...u16(0),...u16(1),...u16(ppq)];return new Uint8Array([...header,...track]);}
+
+// ===== メイン処理 =====
+function parseAll(input){return input.split(/\s+/).map(s=>s.trim()).filter(Boolean).map(parseToken);}
+function rowsToAscii(rows,oct,ppq){
+  let out="";
+  out+="| # | token               | chord | notes(MIDI)          | qtrs | ticks |\n";
+  out+="+---+-------------------+-------+----------------------+------|-------+\n";
+  rows.forEach((r,i)=>{
+    const notes=chordFormula(r.qual).map(iv=>noteNumber(r.root,oct)+iv);
+    const ticks=Math.round(r.quarters*ppq);
+    out+=`| ${String(i+1).padEnd(2)}| ${r.raw.padEnd(19)}| ${(r.root+r.qual).padEnd(6)}| ${notes.join(',').padEnd(20)}| ${r.quarters.toFixed(2).padEnd(4)}| ${ticks}\n`;
+  });
+  return out;
+}
+function buildMidiFromRows(rows){
+  const bpm=parseInt(document.getElementById('bpm').value)||120;
+  const ppq=parseInt(document.getElementById('ppq').value)||480;
+  const oct=parseInt(document.getElementById('octave').value)||4;
+  const ev=[];
+  ev.push(meta(0,0x03,[67,104,111,114,100]));
+  ev.push(tempoMeta(bpm));
+  ev.push(programChange(0,0,0));
+  rows.forEach(r=>{
+    const notes=chordFormula(r.qual).map(iv=>noteNumber(r.root,oct)+iv);
+    const dur=Math.round(r.quarters*ppq);
+    notes.forEach((n,j)=>ev.push(noteOn(j===0?0:0,0,n,96)));
+    notes.forEach((n,j)=>ev.push(noteOff(j===0?dur:0,0,n,0)));
+  });
+  ev.push(meta(0,0x2F,[]));
+  const track=buildTrack(ev);
+  return makeMidi(track,ppq);
+}
+
+// ===== UI =====
+const $input=document.getElementById('input');
+const $ascii=document.getElementById('ascii');
+function refreshPreview(){try{const rows=parseAll($input.value);$ascii.textContent=rowsToAscii(rows,parseInt(document.getElementById('octave').value)||4,parseInt(document.getElementById('ppq').value)||480);}catch(e){$ascii.textContent='エラー:'+e.message;}}
+$input.addEventListener('input',refreshPreview);
+
+document.getElementById('genBtn').onclick=()=>{
+  try{const rows=parseAll($input.value);if(rows.length===0)throw Error('入力が空です');
+    const midi=buildMidiFromRows(rows);
+    const blob=new Blob([midi],{type:'audio/midi'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='chords.mid';a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);
+  }catch(e){alert('エラー:'+e.message);}
+};
+
+document.getElementById('copyAscii').onclick=()=>{navigator.clipboard.writeText($ascii.textContent);};
+
+refreshPreview();
+</script>
+</body>
+</html>
